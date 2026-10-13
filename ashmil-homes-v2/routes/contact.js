@@ -1,5 +1,4 @@
 const express = require('express');
-const nodemailer = require('nodemailer');
 const router = express.Router();
 
 /* ============================================================
@@ -8,29 +7,13 @@ const router = express.Router();
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID   = process.env.TELEGRAM_CHAT_ID;
-const EMAIL_USER         = process.env.EMAIL_USER;
-const EMAIL_PASS         = process.env.EMAIL_PASS;
 
 const telegramEnabled = Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID);
-const emailEnabled    = Boolean(EMAIL_USER && EMAIL_PASS);
 
-if (!telegramEnabled && !emailEnabled) {
-  console.warn('⚠️  Contact form: neither Telegram nor Email is configured. Submissions will be accepted but not delivered.');
+if (!telegramEnabled) {
+  console.warn('⚠️  Contact form: Telegram is not configured. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in Vercel env vars.');
 } else {
-  if (telegramEnabled) console.log('✅ Contact form: Telegram notifications enabled.');
-  if (emailEnabled)    console.log('✅ Contact form: Email notifications enabled.');
-}
-
-/* ============================================================
-   EMAIL TRANSPORTER (optional)
-   ============================================================ */
-
-let transporter = null;
-if (emailEnabled) {
-  transporter = nodemailer.createTransport({
-    service: 'gmail',
-    auth: { user: EMAIL_USER, pass: EMAIL_PASS }
-  });
+  console.log('✅ Contact form: Telegram notifications enabled.');
 }
 
 /* ============================================================
@@ -64,7 +47,8 @@ function rateLimit(req, res, next) {
   next();
 }
 
-// Periodic cleanup
+// Periodic cleanup so the Map doesn't grow forever.
+// .unref() lets the Node process exit cleanly when idle.
 setInterval(() => {
   const now = Date.now();
   for (const [ip, entry] of submissions.entries()) {
@@ -87,6 +71,8 @@ function truncate(str, max) {
   return String(str).slice(0, max);
 }
 
+// Telegram HTML parse mode requires escaping &, <, >.
+// Without this, a message containing "<" or "&" would be rejected by the API.
 function escapeTelegramHtml(str = '') {
   return String(str)
     .replace(/&/g, '&amp;')
@@ -104,7 +90,7 @@ function isValidEmail(email) {
    Uses HTML parse mode; all user content is escaped first.
    ============================================================ */
 
-async function sendToTelegram({ name, email, phone, message, ip }) {
+async function sendToTelegram({ name, email, phone, message }) {
   const timestamp = new Date().toLocaleString('en-NG', {
     timeZone: 'Africa/Lagos',
     dateStyle: 'medium',
@@ -155,26 +141,6 @@ async function sendToTelegram({ name, email, phone, message, ip }) {
 }
 
 /* ============================================================
-   EMAIL SENDER (optional fallback)
-   ============================================================ */
-
-async function sendToEmail({ name, email, phone, message }) {
-  await transporter.sendMail({
-    from: `"Ashmil Homes Enquiry" <${EMAIL_USER}>`,   // from YOUR address, not the visitor's
-    replyTo: `"${name}" <${email}>`,                  // so you can hit reply and it goes to them
-    to: EMAIL_USER,
-    subject: `New enquiry from ${name}`,
-    text: [
-      `Name:  ${name}`,
-      `Email: ${email}`,
-      `Phone: ${phone || '—'}`,
-      '',
-      message
-    ].join('\n')
-  });
-}
-
-/* ============================================================
    POST /api/contact
    Body: { name, email, phone?, message, source?, timestamp? }
    Returns: { success: true } on delivery, { success: false, error } otherwise.
@@ -183,7 +149,6 @@ async function sendToEmail({ name, email, phone, message }) {
 router.post('/', rateLimit, async (req, res) => {
   try {
     const body = req.body || {};
-    const ip = (req.headers['x-forwarded-for']?.split(',')[0]?.trim()) || req.ip || 'unknown';
 
     // --- Extract + trim ---
     const name    = String(body.name    || '').trim();
@@ -207,58 +172,28 @@ router.post('/', rateLimit, async (req, res) => {
       name:    truncate(name,    LIMITS.name),
       email:   truncate(email,   LIMITS.email),
       phone:   truncate(phone,   LIMITS.phone),
-      message: truncate(message, LIMITS.message),
-      ip
+      message: truncate(message, LIMITS.message)
     };
 
-    // --- Attempt delivery ---
-    const results = { telegram: null, email: null };
-    const errors  = [];
-
-    if (telegramEnabled) {
-      try {
-        await sendToTelegram(payload);
-        results.telegram = 'ok';
-      } catch (err) {
-        results.telegram = 'failed';
-        errors.push(`telegram: ${err.message}`);
-        console.error('❌ Telegram send failed:', err.message);
-      }
-    }
-
-    if (emailEnabled) {
-      try {
-        await sendToEmail(payload);
-        results.email = 'ok';
-      } catch (err) {
-        results.email = 'failed';
-        errors.push(`email: ${err.message}`);
-        console.error('❌ Email send failed:', err.message);
-      }
-    }
-
-    // --- No delivery channel configured ---
-    if (!telegramEnabled && !emailEnabled) {
-      console.error('❌ Contact form received but no delivery channel is configured.');
+    // --- Delivery ---
+    if (!telegramEnabled) {
+      console.error('❌ Contact form received but Telegram is not configured.');
       return res.status(500).json({
         success: false,
         error: 'Message system is not configured. Please contact us directly via WhatsApp or phone.'
       });
     }
 
-    // --- Success if AT LEAST ONE channel succeeded ---
-    const anySucceeded = results.telegram === 'ok' || results.email === 'ok';
-
-    if (anySucceeded) {
+    try {
+      await sendToTelegram(payload);
       return res.json({ success: true });
+    } catch (err) {
+      console.error('❌ Telegram send failed:', err.message);
+      return res.status(500).json({
+        success: false,
+        error: 'Could not deliver your message. Please try again or reach us on WhatsApp.'
+      });
     }
-
-    // --- All channels failed ---
-    console.error('❌ All delivery channels failed:', errors);
-    return res.status(500).json({
-      success: false,
-      error: 'Could not deliver your message. Please try again or reach us on WhatsApp.'
-    });
 
   } catch (err) {
     console.error('❌ Contact route error:', err);
